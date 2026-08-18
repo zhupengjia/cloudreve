@@ -51,8 +51,9 @@ func New(kv cache.Driver) CredManager {
 
 type (
 	credManager struct {
-		kv cache.Driver
-		mu sync.RWMutex
+		kv           cache.Driver
+		mu           sync.RWMutex
+		refreshAllMu sync.Mutex
 
 		locks map[string]*sync.Mutex
 	}
@@ -63,41 +64,65 @@ var (
 )
 
 func (m *credManager) Upsert(ctx context.Context, cred ...Credential) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	l := logging.FromContext(ctx)
 	for _, c := range cred {
 		l.Info("CredManager: Upsert credential for key %q...", c.Key())
-		if err := m.kv.Set(c.Key(), c, 0); err != nil {
-			return fmt.Errorf("failed to update credential in KV for key %q: %w", c.Key(), err)
-		}
 
-		if _, ok := m.locks[c.Key()]; !ok {
-			m.locks[c.Key()] = &sync.Mutex{}
+		lock := m.lockForKey(c.Key())
+		lock.Lock()
+		err := m.kv.Set(c.Key(), c, 0)
+		lock.Unlock()
+		if err != nil {
+			return fmt.Errorf("failed to update credential in KV for key %q: %w", c.Key(), err)
 		}
 	}
 
 	return nil
 }
 
-func (m *credManager) Obtain(ctx context.Context, key string) (Credential, error) {
+func (m *credManager) getLock(key string) (*sync.Mutex, bool) {
 	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	lock, ok := m.locks[key]
+	return lock, ok
+}
+
+func (m *credManager) lockForKey(key string) *sync.Mutex {
+	if lock, ok := m.getLock(key); ok {
+		return lock
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.locks[key]; !ok {
+		m.locks[key] = &sync.Mutex{}
+	}
+
+	return m.locks[key]
+}
+
+func (m *credManager) Obtain(ctx context.Context, key string) (Credential, error) {
+	lock, ok := m.getLock(key)
+	if !ok {
+		if _, exists := m.kv.Get(key); !exists {
+			return nil, fmt.Errorf("credential not found for key %q: %w", key, ErrNotFound)
+		}
+		lock = m.lockForKey(key)
+	}
+
+	lock.Lock()
+	defer lock.Unlock()
+
 	itemRaw, ok := m.kv.Get(key)
 	if !ok {
-		m.mu.RUnlock()
 		return nil, fmt.Errorf("credential not found for key %q: %w", key, ErrNotFound)
 	}
 
 	l := logging.FromContext(ctx)
 
 	item := itemRaw.(Credential)
-	if _, ok := m.locks[key]; !ok {
-		m.locks[key] = &sync.Mutex{}
-	}
-	m.locks[key].Lock()
-	defer m.locks[key].Unlock()
-	m.mu.RUnlock()
 
 	if item.Expiry().After(time.Now()) {
 		// Credential is still valid
@@ -120,17 +145,24 @@ func (m *credManager) Obtain(ctx context.Context, key string) (Credential, error
 }
 
 func (m *credManager) RefreshAll(ctx context.Context) {
+	m.refreshAllMu.Lock()
+	defer m.refreshAllMu.Unlock()
+
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	locks := make(map[string]*sync.Mutex, len(m.locks))
+	for key, lock := range m.locks {
+		locks[key] = lock
+	}
+	m.mu.RUnlock()
 
 	l := logging.FromContext(ctx)
-	for key := range m.locks {
+	for key, lock := range locks {
 		l.Info("Refreshing credential for key %q...", key)
-		m.locks[key].Lock()
-		defer m.locks[key].Unlock()
+		lock.Lock()
 
 		itemRaw, ok := m.kv.Get(key)
 		if !ok {
+			lock.Unlock()
 			l.Warning("Credential not found for key %q", key)
 			continue
 		}
@@ -138,12 +170,15 @@ func (m *credManager) RefreshAll(ctx context.Context) {
 		item := itemRaw.(Credential)
 		newCred, err := item.Refresh(ctx)
 		if err != nil {
+			lock.Unlock()
 			l.Warning("Failed to refresh credential for key %q: %s", key, err)
 			continue
 		}
 
 		l.Info("New credential for key %q is obtained, expire at %s", key, newCred.Expiry().String())
-		if err := m.kv.Set(key, newCred, 0); err != nil {
+		err = m.kv.Set(key, newCred, 0)
+		lock.Unlock()
+		if err != nil {
 			l.Warning("Failed to update credential in KV for key %q: %s", key, err)
 		}
 	}
