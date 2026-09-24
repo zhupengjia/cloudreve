@@ -38,6 +38,12 @@ func (c *refreshTestCache) Get(_ string) (any, bool) {
 	return c.value, c.value != nil
 }
 
+func (c *refreshTestCache) evict() {
+	c.mu.Lock()
+	c.value = nil
+	c.mu.Unlock()
+}
+
 type refreshTestCredential struct {
 	key            string
 	expiresAt      time.Time
@@ -77,6 +83,9 @@ func TestObtainReadsCredentialUnderKeyLock(t *testing.T) {
 	credential := refreshTestCredential{key: "test", expiresAt: time.Now().Add(time.Hour)}
 	require.NoError(t, manager.Upsert(context.Background(), credential))
 
+	manager.mu.Lock()
+	delete(manager.credentials, credential.key)
+	manager.mu.Unlock()
 	store.lockToCheck = manager.locks[credential.key]
 	_, err := manager.Obtain(context.Background(), credential.key)
 
@@ -132,4 +141,44 @@ func TestObtainMissingCredentialDoesNotCreateLock(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 	_, exists := manager.getLock("missing")
 	require.False(t, exists)
+}
+
+func TestObtainRestoresEvictedCredential(t *testing.T) {
+	store := &refreshTestCache{}
+	manager := New(store)
+	var refreshes atomic.Int32
+	credential := refreshTestCredential{
+		key:       "test",
+		expiresAt: time.Now().Add(-time.Hour),
+		refreshes: &refreshes,
+	}
+	require.NoError(t, manager.Upsert(context.Background(), credential))
+	store.evict()
+
+	got, err := manager.Obtain(context.Background(), credential.key)
+
+	require.NoError(t, err)
+	require.Equal(t, int32(1), refreshes.Load())
+	require.True(t, got.Expiry().After(time.Now()))
+	_, exists := store.Get(credential.key)
+	require.True(t, exists)
+}
+
+func TestRefreshAllRestoresEvictedCredential(t *testing.T) {
+	store := &refreshTestCache{}
+	manager := New(store)
+	var refreshes atomic.Int32
+	credential := refreshTestCredential{
+		key:       "test",
+		expiresAt: time.Now().Add(-time.Hour),
+		refreshes: &refreshes,
+	}
+	require.NoError(t, manager.Upsert(context.Background(), credential))
+	store.evict()
+
+	manager.RefreshAll(context.Background())
+
+	require.Equal(t, int32(1), refreshes.Load())
+	_, exists := store.Get(credential.key)
+	require.True(t, exists)
 }
